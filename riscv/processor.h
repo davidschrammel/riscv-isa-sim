@@ -6,11 +6,13 @@
 #include "config.h"
 #include "devices.h"
 #include "trap.h"
+#include "mpkey.h"
 #include <string>
 #include <vector>
 #include <map>
 #include "debug_rom_defines.h"
 
+class mpkey_t;
 class processor_t;
 class mmu_t;
 typedef reg_t (*insn_func_t)(processor_t*, insn_t, reg_t);
@@ -83,6 +85,25 @@ typedef struct
   bool load;
 } mcontrol_t;
 
+
+// typedef union {
+//   struct __attribute__((packed)) {
+//     unsigned mode           : 1;
+//     unsigned sw             :19;
+//     unsigned slot_3_wd      : 1;
+//     unsigned slot_3_mpkey   :10;
+//     unsigned slot_2_wd      : 1;
+//     unsigned slot_2_mpkey   :10;
+//     unsigned slot_1_wd      : 1;
+//     unsigned slot_1_mpkey   :10;
+//     unsigned slot_0_wd      : 1;
+//     unsigned slot_0_mpkey   :10;
+//     //                 +_______
+//     //                       64
+//   } config_fields;
+//     reg_t bits;
+// } csr_mpkey_config_t;
+
 // architectural state of a RISC-V hart
 struct state_t
 {
@@ -108,6 +129,8 @@ struct state_t
   reg_t mip;
   reg_t medeleg;
   reg_t mideleg;
+  reg_t sedeleg;
+  reg_t sideleg;
   uint32_t mcounteren;
   uint32_t scounteren;
   reg_t sepc;
@@ -116,6 +139,11 @@ struct state_t
   reg_t stvec;
   reg_t satp;
   reg_t scause;
+  reg_t uepc;
+  reg_t utval;
+  reg_t utvec;
+  reg_t ucause;
+  reg_t uscratch;
   reg_t dpc;
   reg_t dscratch;
   dcsr_t dcsr;
@@ -130,6 +158,9 @@ struct state_t
   uint32_t fflags;
   uint32_t frm;
   bool serialized; // whether timer CSRs are in a well-defined state
+
+  // memory protection key register
+  mpkey_t mpkey;
 
   // When true, execute a single instruction and then enter debug mode.  This
   // can only be set by executing dret.

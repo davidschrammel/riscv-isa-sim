@@ -1,3 +1,4 @@
+//fprintf(stderr, "\033[0;32mSpike: mret. pc old = 0x%llx. new pc = mepc = 0x%llx\033[0m\n", p->get_state()->pc, p->get_state()->mepc);
 require_privilege(PRV_M);
 set_pc_and_serialize(p->get_state()->mepc);
 reg_t s = STATE.mstatus;

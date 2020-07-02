@@ -265,6 +265,8 @@ inline freg_t f128_negate(freg_t a)
   return a;
 }
 
+//Probably TODO: other ranges as per priv spec: 
+//"Allocation of RISC-V CSR address ranges"
 #define validate_csr(which, write) ({ \
   if (!STATE.serialized) return PC_SERIALIZE_BEFORE; \
   STATE.serialized = false; \

@@ -14,6 +14,7 @@ riscv_hdrs = \
 	dts.h \
 	mmu.h \
 	processor.h \
+	mpkey.h \
 	sim.h \
 	simif.h \
 	trap.h \
@@ -35,6 +36,7 @@ riscv_precompiled_hdrs = \
 
 riscv_srcs = \
 	processor.cc \
+	mpkey.cc \
 	execute.cc \
 	dts.cc \
 	sim.cc \
@@ -287,6 +289,7 @@ riscv_insn_list = \
 	sub \
 	subw \
 	sw \
+	uret \
 	wfi \
 	xor \
 	xori \

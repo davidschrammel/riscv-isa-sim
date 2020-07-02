@@ -3,6 +3,7 @@
 #include "mmu.h"
 #include "simif.h"
 #include "processor.h"
+#include "mpkey.h"
 
 mmu_t::mmu_t(simif_t* sim, processor_t* proc)
  : sim(sim), proc(proc),
@@ -56,8 +57,11 @@ reg_t mmu_t::translate(reg_t addr, reg_t len, access_type type)
   }
 
   reg_t paddr = walk(addr, type, mode) | (addr & (PGSIZE-1));
-  if (!pmp_ok(paddr, type, mode) || !pmp_homogeneous(paddr, len))
+
+  if (!pmp_ok(paddr, type, mode) || !pmp_homogeneous(paddr, len)){
     throw_access_exception(addr, type);
+  }
+
   return paddr;
 }
 
@@ -248,6 +252,7 @@ reg_t mmu_t::pmp_homogeneous(reg_t addr, reg_t len)
 
 reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
 {
+  bool mpkey_access_vialation = false;
   vm_info vm = decode_vm_info(proc->max_xlen, mode, proc->get_state()->satp);
   if (vm.levels == 0)
     return addr & ((reg_t(2) << (proc->xlen-1))-1); // zero-extend from xlen
@@ -264,6 +269,8 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
     vm.levels = 0;
 
   reg_t base = vm.ptbase;
+  reg_t pte_mpkey = 0;
+  reg_t pte = 0;
   for (int i = vm.levels - 1; i >= 0; i--) {
     int ptshift = i * vm.idxbits;
     reg_t idx = (addr >> (PGSHIFT + ptshift)) & ((1 << vm.idxbits) - 1);
@@ -271,11 +278,14 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
     // check that physical address of PTE is legal
     auto pte_paddr = base + idx * vm.ptesize;
     auto ppte = sim->addr_to_mem(pte_paddr);
-    if (!ppte || !pmp_ok(pte_paddr, LOAD, PRV_S))
+    if (!ppte || !pmp_ok(pte_paddr, LOAD, PRV_S)) {
       throw_access_exception(addr, type);
+    }
 
-    reg_t pte = vm.ptesize == 4 ? *(uint32_t*)ppte : *(uint64_t*)ppte;
-    reg_t ppn = pte >> PTE_PPN_SHIFT;
+    pte = vm.ptesize == 4 ? *(uint32_t*)ppte : *(uint64_t*)ppte;
+    reg_t ppn = (pte & 0x3FFFFFFFFFFFFF) >> PTE_PPN_SHIFT;
+    pte_mpkey = (pte & PTE_MPKEY) >> PTE_MPKEY_SHIFT;
+
 
     if (PTE_TABLE(pte)) { // next level of page table
       base = ppn << PGSHIFT;
@@ -289,13 +299,35 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
       break;
     } else if ((ppn & ((reg_t(1) << ptshift) - 1)) != 0) {
       break;
+      // check for mpkey access errors
+    } else if (((pte_mpkey != proc->get_state()->mpkey.get_key(0))
+             && (pte_mpkey != proc->get_state()->mpkey.get_key(1))
+             && (pte_mpkey != proc->get_state()->mpkey.get_key(2))
+             && (pte_mpkey != proc->get_state()->mpkey.get_key(3)))
+             && (pte_mpkey != 0)  // reserved bits may be all 0
+             && (pte_mpkey != 0x3FF)  // or all 1 to preserve backwards compatibility
+             && (mode == PRV_U)
+             && (proc->get_state()->mpkey.get_mode() == 0)) {
+        mpkey_access_vialation = true;
+        break;
+    // Having the correct key but performing a store with a write disabled key causes an error
+  } else if ( (type == STORE) && (mode == PRV_U) && //TODO mode == U
+         (pte_mpkey != 0) && (pte_mpkey != 0x3FF) &&
+         (    (pte_mpkey == proc->get_state()->mpkey.get_key(0) && proc->get_state()->mpkey.get_write_disable(0) == 1)
+           || (pte_mpkey == proc->get_state()->mpkey.get_key(1) && proc->get_state()->mpkey.get_write_disable(1) == 1)
+           || (pte_mpkey == proc->get_state()->mpkey.get_key(2) && proc->get_state()->mpkey.get_write_disable(2) == 1)
+           || (pte_mpkey == proc->get_state()->mpkey.get_key(3) && proc->get_state()->mpkey.get_write_disable(3) == 1)
+          ) ) {
+      mpkey_access_vialation = true;
+      break;
     } else {
       reg_t ad = PTE_A | ((type == STORE) * PTE_D);
 #ifdef RISCV_ENABLE_DIRTY
       // set accessed and possibly dirty bits.
       if ((pte & ad) != ad) {
-        if (!pmp_ok(pte_paddr, STORE, PRV_S))
+        if (!pmp_ok(pte_paddr, STORE, PRV_S)){
           throw_access_exception(addr, type);
+        }
         *(uint32_t*)ppte |= ad;
       }
 #else
@@ -308,6 +340,59 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
       reg_t value = (ppn | (vpn & ((reg_t(1) << ptshift) - 1))) << PGSHIFT;
       return value;
     }
+  }
+
+  //print more debug info in case a fault happens
+  if(false && pte){
+    char* mode_s = "?";
+    char* type_s = "?????";
+
+    switch (mode) {
+      case PRV_U: mode_s = "U"; break;
+      case PRV_S: mode_s = "S"; break;
+      case PRV_H: mode_s = "H"; break;
+      case PRV_M: mode_s = "M"; break;
+    }
+    switch (type) {
+      case FETCH: type_s = "FETCH"; break;
+      case LOAD:  type_s = "LOAD ";  break;
+      case STORE: type_s = "STORE"; break;
+    }
+    fprintf(stderr, "\033[0;31mSpike: Fault: type=%d=%s, mode=%lu=%s. addr=0x%8lx. utvec=0x%lx. pte=%16lx(u=%d,v=%d,r=%d,w=%d,x=%d,pk=%lu). pc=0x%lx. ", 
+      type,
+      type_s,
+      mode, 
+      mode_s,
+      addr,
+      proc->get_state()->utvec,
+      pte,
+      !!(pte & PTE_U),
+      !!(pte & PTE_V),
+      !!(pte & PTE_R),
+      !!(pte & PTE_W),
+      !!(pte & PTE_X),
+      pte_mpkey,
+      proc->get_state()->pc
+    );
+    mpkey_t * mpk = &(proc->get_state()->mpkey);
+    fprintf(stderr, "mpk=0x%lx=(%lu,%lu) (%lu,%lu) (%lu,%lu) (%lu,%lu). \033[0m\n", 
+      mpk->get_bits(),
+      mpk->get_key(3), mpk->get_write_disable(3),
+      mpk->get_key(2), mpk->get_write_disable(2),
+      mpk->get_key(1), mpk->get_write_disable(1),
+      mpk->get_key(0), mpk->get_write_disable(0)
+    );
+  }
+
+  if (mpkey_access_vialation == true) {
+    /*fprintf(stderr, "\033[0;31mSpike: throwing trap_mpkey_mismatch_fault. mode=%lu. addr=0x%8lx.  medeleg=0x%lx. sedeleg=0x%lx. utvec=0x%lx.\033[0m\n", 
+      mode, 
+      addr,
+      proc->get_state()->medeleg, 
+      proc->get_state()->sedeleg,
+      proc->get_state()->utvec
+    );*/
+    throw trap_mpkey_mismatch_fault(addr);
   }
 
   switch (type) {

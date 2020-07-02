@@ -2,6 +2,7 @@
 
 #include "processor.h"
 #include "extension.h"
+#include "mpkey.h"
 #include "common.h"
 #include "config.h"
 #include "simif.h"
@@ -65,7 +66,7 @@ void processor_t::parse_isa_string(const char* str)
     lowercase += std::tolower(*r);
 
   const char* p = lowercase.c_str();
-  const char* all_subsets = "imafdqc";
+  const char* all_subsets = "imafdqcn";
 
   max_xlen = 64;
   state.misa = reg_t(2) << 62;
@@ -78,7 +79,7 @@ void processor_t::parse_isa_string(const char* str)
     p += 2;
 
   if (!*p) {
-    p = "imafdc";
+    p = "imafdcn";
   } else if (*p == 'g') { // treat "G" as "IMAFD"
     tmp = std::string("imafd") + (p+1);
     p = &tmp[0];
@@ -272,26 +273,67 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
   }
 
   // by default, trap to M-mode, unless delegated to S-mode
+  // or delegated to U-Mode
   reg_t bit = t.cause();
-  reg_t deleg = state.medeleg;
+  reg_t mdeleg = state.medeleg;
+  reg_t sdeleg = state.sedeleg;
   bool interrupt = (bit & ((reg_t)1 << (max_xlen-1))) != 0;
-  if (interrupt)
-    deleg = state.mideleg, bit &= ~((reg_t)1 << (max_xlen-1));
-  if (state.prv <= PRV_S && bit < max_xlen && ((deleg >> bit) & 1)) {
-    // handle the trap in S-mode
-    state.pc = state.stvec;
-    state.scause = t.cause();
-    state.sepc = epc;
-    state.stval = t.get_tval();
+  if (interrupt) {
+    mdeleg = state.mideleg;
+    sdeleg = state.sideleg;
+    bit &= ~((reg_t)1 << (max_xlen-1)); 
+  }
+  if (state.prv <= PRV_S && bit < max_xlen && ((mdeleg >> bit) & 1)) {
+    // custom N- extension usersapce exception // supports_extension('N') &&
+    if (supports_extension('N') && state.mpkey.get_mode() == 1 && !interrupt) {
+      // MPKEY mismatch or ecall cannot be re-delegated while mode=1
+      // They will trap to the kernel instead
+      reg_t ignoremask = 1U << CAUSE_MPKEY_MISMATCH_FAULT;
+      ignoremask |= 1U << CAUSE_USER_ECALL;
+      sdeleg &= ~(ignoremask);
+    }
 
-    reg_t s = state.mstatus;
-    s = set_field(s, MSTATUS_SPIE, get_field(s, MSTATUS_SIE));
-    s = set_field(s, MSTATUS_SPP, state.prv);
-    s = set_field(s, MSTATUS_SIE, 0);
-    set_csr(CSR_MSTATUS, s);
-    set_privilege(PRV_S);
+    if  (state.prv == PRV_U && bit < max_xlen && ((sdeleg >> bit) & 1)) {
+
+      if (supports_extension('N') && (t.cause() == CAUSE_MPKEY_MISMATCH_FAULT || t.cause() == CAUSE_USER_ECALL)) {
+        state.mpkey.set_mode(1);
+      }else{
+        //there should be no exception other than mpkey_mismatch_fault
+        assert(false);
+      }
+
+      // handle the trap in U-mode
+      reg_t vector = (state.utvec & 1) ? 4*bit : 0;
+      state.pc = (state.utvec & ~(reg_t)1) + vector;
+      //state.pc = state.utvec;
+      state.ucause = t.cause();
+      state.uepc = epc;
+      state.utval = t.get_tval();
+
+      reg_t s = state.mstatus;
+      s = set_field(s, MSTATUS_UPIE, get_field(s, MSTATUS_UIE));
+      s = set_field(s, MSTATUS_UIE, 0);
+      set_csr(CSR_MSTATUS, s);
+      set_privilege(PRV_U);
+    } else {
+      // handle the trap in S-mode
+      reg_t vector = (state.stvec & 1) ? 4*bit : 0;
+      state.pc = (state.stvec & ~(reg_t)1) + vector;
+      //state.pc = state.stvec;
+      state.scause = t.cause();
+      state.sepc = epc;
+      state.stval = t.get_tval();
+
+      reg_t s = state.mstatus;
+      s = set_field(s, MSTATUS_SPIE, get_field(s, MSTATUS_SIE));
+      s = set_field(s, MSTATUS_SPP, state.prv);
+      s = set_field(s, MSTATUS_SIE, 0);
+      set_csr(CSR_MSTATUS, s);
+      set_privilege(PRV_S);
+    }
   } else {
-    reg_t vector = (state.mtvec & 1) && interrupt ? 4*bit : 0;
+    //reg_t vector = (state.mtvec & 1) && interrupt ? 4*bit : 0;
+    reg_t vector = (state.mtvec & 1) ? 4*bit : 0;
     state.pc = (state.mtvec & ~(reg_t)1) + vector;
     state.mepc = epc;
     state.mcause = t.cause();
@@ -387,6 +429,9 @@ void processor_t::set_csr(int which, reg_t val)
       if (supports_extension('S'))
         mask |= MSTATUS_SPP;
 
+      if (supports_extension('U'))
+        mask |= MSTATUS_UIE | MSTATUS_UPIE;
+
       state.mstatus = (state.mstatus & ~mask) | (val & mask);
 
       bool dirty = (state.mstatus & MSTATUS_FS) == MSTATUS_FS;
@@ -396,7 +441,6 @@ void processor_t::set_csr(int which, reg_t val)
       else
         state.mstatus = set_field(state.mstatus, MSTATUS64_SD, dirty);
 
-      state.mstatus = set_field(state.mstatus, MSTATUS_UXL, xlen_to_uxl(max_xlen));
       state.mstatus = set_field(state.mstatus, MSTATUS_UXL, xlen_to_uxl(max_xlen));
       state.mstatus = set_field(state.mstatus, MSTATUS_SXL, xlen_to_uxl(max_xlen));
       // U-XLEN == S-XLEN == M-XLEN
@@ -421,6 +465,7 @@ void processor_t::set_csr(int which, reg_t val)
         (1 << CAUSE_USER_ECALL) |
         (1 << CAUSE_FETCH_PAGE_FAULT) |
         (1 << CAUSE_LOAD_PAGE_FAULT) |
+        (1 << CAUSE_MPKEY_MISMATCH_FAULT) |
         (1 << CAUSE_STORE_PAGE_FAULT);
       state.medeleg = (state.medeleg & ~mask) | (val & mask);
       break;
@@ -453,13 +498,39 @@ void processor_t::set_csr(int which, reg_t val)
                  | SSTATUS_XS | SSTATUS_SUM | SSTATUS_MXR;
       return set_csr(CSR_MSTATUS, (state.mstatus & ~mask) | (val & mask));
     }
+    case CSR_USTATUS: {
+        reg_t mask = USTATUS_UIE | USTATUS_UPIE;
+        return set_csr(CSR_MSTATUS, (state.mstatus & ~mask) | (val & mask));
+    }
+    case CSR_SIDELEG:
+      state.sideleg = (state.sideleg & ~delegable_ints) | (val & delegable_ints);
+      break;
+    case CSR_SEDELEG: {
+      reg_t mask =
+        (1 << CAUSE_MISALIGNED_FETCH) |
+        (1 << CAUSE_BREAKPOINT) |
+        (1 << CAUSE_USER_ECALL) |
+        (1 << CAUSE_FETCH_PAGE_FAULT) |
+        (1 << CAUSE_LOAD_PAGE_FAULT) |
+        (1 << CAUSE_MPKEY_MISMATCH_FAULT) |
+        (1 << CAUSE_STORE_PAGE_FAULT);
+      state.sedeleg = (state.sedeleg & ~mask) | (val & mask);
+      break;
+    }
     case CSR_SIP: {
       reg_t mask = MIP_SSIP & state.mideleg;
+      return set_csr(CSR_MIP, (state.mip & ~mask) | (val & mask));
+    }
+    case CSR_UIP: {
+      reg_t mask = MIP_USIP & state.sideleg;
       return set_csr(CSR_MIP, (state.mip & ~mask) | (val & mask));
     }
     case CSR_SIE:
       return set_csr(CSR_MIE,
                      (state.mie & ~state.mideleg) | (val & state.mideleg));
+    case CSR_UIE:
+      return set_csr(CSR_UIE,
+                     ((state.mie & ~state.mideleg) & ~state.sideleg) | ((val & state.mideleg) & ~state.sideleg));
     case CSR_SATP: {
       mmu->flush_tlb();
       if (max_xlen == 32)
@@ -475,6 +546,36 @@ void processor_t::set_csr(int which, reg_t val)
     case CSR_SSCRATCH: state.sscratch = val; break;
     case CSR_SCAUSE: state.scause = val; break;
     case CSR_STVAL: state.stval = val; break;
+
+    case CSR_UTVEC:
+      if ( state.prv == PRV_M
+        || state.prv == PRV_S
+        || (state.prv == PRV_U && state.mpkey.get_mode() == 1)
+      ) {
+        // TODO What about the alignment requirement if it's vectored? (same goes for stvec,mtvec)
+        val = ((val >> 2) << 2) | (val & 0x1);
+        if(val != state.utvec){
+            state.utvec = val;
+            //fprintf(stderr, "Spike: state.utvec = 0x%lx\n", state.utvec);
+        }
+        break;
+      }else{
+        fprintf(stderr, "Spike: not setting utvec to 0x%lx (because no permissions)\n", val);
+      }
+    case CSR_USCRATCH:
+      if ( state.prv == PRV_M
+        || state.prv == PRV_S
+        || (state.prv == PRV_U && state.mpkey.get_mode() == 1)
+      ) {
+        state.uscratch = val; break;
+        //fprintf(stderr, "Spike: state.uscratch = 0x%lx\n", state.uscratch);
+      }else{
+        fprintf(stderr, "Spike: not setting uscratch to 0x%lx (because no permissions)\n", val);
+      }
+    case CSR_UEPC: state.uepc = val & ~(reg_t)1; break;
+    case CSR_UCAUSE: state.ucause = val; break;
+    case CSR_UTVAL: state.utval = val; break;
+
     case CSR_MEPC: state.mepc = val & ~(reg_t)1; break;
     case CSR_MTVEC: state.mtvec = val & ~(reg_t)2; break;
     case CSR_MSCRATCH: state.mscratch = val; break;
@@ -488,13 +589,14 @@ void processor_t::set_csr(int which, reg_t val)
       if (!(val & (1L << ('F' - 'A'))))
         val &= ~(1L << ('D' - 'A'));
 
-      // allow MAFDC bits in MISA to be modified
+      // allow MAFDCN bits in MISA to be modified
       reg_t mask = 0;
       mask |= 1L << ('M' - 'A');
       mask |= 1L << ('A' - 'A');
       mask |= 1L << ('F' - 'A');
       mask |= 1L << ('D' - 'A');
       mask |= 1L << ('C' - 'A');
+      mask |= 1L << ('N' - 'A');
       mask &= max_isa;
 
       state.misa = (val & mask) | (state.misa & ~mask);
@@ -554,6 +656,18 @@ void processor_t::set_csr(int which, reg_t val)
     case CSR_DSCRATCH:
       state.dscratch = val;
       break;
+    case CSR_MPK:
+      if (  state.prv == PRV_M
+        ||  state.prv == PRV_S
+        || (state.prv == PRV_U && state.mpkey.get_mode() == 1)
+      ) {
+        if(val != state.mpkey.get_bits()){
+          state.mpkey.set_register(val);
+          //fprintf(stderr, "Spike: state.mpkey = 0x%lx\n", state.mpkey.get_bits());
+        }
+      }else{
+        printf("spike: not setting mpkey to 0x%lx (because no permissions)\n", val);
+      }
   }
 }
 
@@ -654,6 +768,23 @@ reg_t processor_t::get_csr(int which)
         require_privilege(PRV_M);
       return state.satp;
     case CSR_SSCRATCH: return state.sscratch;
+
+    case CSR_USTATUS: {
+      reg_t mask = USTATUS_UIE | USTATUS_UPIE;
+      reg_t ustatus = state.mstatus & mask;
+      return ustatus;
+    }
+    case CSR_UIE: return state.mie & state.mideleg & state.sideleg;
+    case CSR_UIP: return state.mip & state.mideleg & state.sideleg;
+    case CSR_UTVEC: return state.utvec;
+    case CSR_USCRATCH: return state.uscratch;
+    case CSR_UEPC: return state.uepc & pc_alignment_mask();
+    case CSR_UCAUSE:
+      if (max_xlen > xlen)
+        return state.ucause | ((state.ucause >> (max_xlen-1)) << (xlen-1));
+      return state.ucause;
+    case CSR_UTVAL: return state.utval;
+
     case CSR_MSTATUS: return state.mstatus;
     case CSR_MIP: return state.mip;
     case CSR_MIE: return state.mie;
@@ -669,6 +800,8 @@ reg_t processor_t::get_csr(int which)
     case CSR_MTVEC: return state.mtvec;
     case CSR_MEDELEG: return state.medeleg;
     case CSR_MIDELEG: return state.mideleg;
+    case CSR_SEDELEG: return state.sedeleg;
+    case CSR_SIDELEG: return state.sideleg;
     case CSR_TSELECT: return state.tselect;
     case CSR_TDATA1:
       if (state.tselect < state.num_triggers) {
@@ -721,6 +854,10 @@ reg_t processor_t::get_csr(int which)
       return state.dpc & pc_alignment_mask();
     case CSR_DSCRATCH:
       return state.dscratch;
+    case CSR_MPK:
+      return state.mpkey.get_bits();
+    case 0x047: //TODO maybe remove later:
+      return state.misa;
   }
   throw trap_illegal_instruction(0);
 }

@@ -27,6 +27,9 @@
 #define MSTATUS_SXL         0x0000000C00000000
 #define MSTATUS64_SD        0x8000000000000000
 
+#define USTATUS_UIE         0x00000001
+#define USTATUS_UPIE        0x00000010
+
 #define SSTATUS_UIE         0x00000001
 #define SSTATUS_SIE         0x00000002
 #define SSTATUS_UPIE        0x00000010
@@ -95,6 +98,7 @@
 #define MCONTROL_MATCH_MASK_LOW  4
 #define MCONTROL_MATCH_MASK_HIGH 5
 
+#define MIP_USIP            (1 << IRQ_U_SOFT)
 #define MIP_SSIP            (1 << IRQ_S_SOFT)
 #define MIP_HSIP            (1 << IRQ_H_SOFT)
 #define MIP_MSIP            (1 << IRQ_M_SOFT)
@@ -138,6 +142,7 @@
 #define PMP_NA4   0x10
 #define PMP_NAPOT 0x18
 
+#define IRQ_U_SOFT   0
 #define IRQ_S_SOFT   1
 #define IRQ_H_SOFT   2
 #define IRQ_M_SOFT   3
@@ -166,8 +171,10 @@
 #define PTE_A     0x040 // Accessed
 #define PTE_D     0x080 // Dirty
 #define PTE_SOFT  0x300 // Reserved for Software
+#define PTE_MPKEY 0xFFC0000000000000ULL // MPkey Bits in the PTE
 
 #define PTE_PPN_SHIFT 10
+#define PTE_MPKEY_SHIFT 54
 
 #define PTE_TABLE(PTE) (((PTE) & (PTE_V | PTE_R | PTE_W | PTE_X)) == PTE_V)
 
@@ -748,6 +755,8 @@
 #define MASK_CUSTOM3_RD_RS1  0x707f
 #define MATCH_CUSTOM3_RD_RS1_RS2 0x707b
 #define MASK_CUSTOM3_RD_RS1_RS2  0x707f
+// Memory Protection keys
+#define CSR_MPK 0x046
 #define CSR_FFLAGS 0x1
 #define CSR_FRM 0x2
 #define CSR_FCSR 0x3
@@ -783,7 +792,17 @@
 #define CSR_HPMCOUNTER29 0xc1d
 #define CSR_HPMCOUNTER30 0xc1e
 #define CSR_HPMCOUNTER31 0xc1f
+#define CSR_USTATUS 0x000
+#define CSR_UIE 0x004
+#define CSR_UTVEC 0x005
+#define CSR_USCRATCH 0x040
+#define CSR_UEPC 0x041
+#define CSR_UCAUSE 0x042
+#define CSR_UTVAL 0x043
+#define CSR_UIP 0x044
 #define CSR_SSTATUS 0x100
+#define CSR_SEDELEG 0x102
+#define CSR_SIDELEG 0x103
 #define CSR_SIE 0x104
 #define CSR_STVEC 0x105
 #define CSR_SCOUNTEREN 0x106
@@ -973,6 +992,7 @@
 #define CAUSE_MACHINE_ECALL 0xb
 #define CAUSE_FETCH_PAGE_FAULT 0xc
 #define CAUSE_LOAD_PAGE_FAULT 0xd
+#define CAUSE_MPKEY_MISMATCH_FAULT 0xe
 #define CAUSE_STORE_PAGE_FAULT 0xf
 #endif
 #ifdef DECLARE_INSN
@@ -1240,6 +1260,7 @@ DECLARE_INSN(custom3_rd_rs1, MATCH_CUSTOM3_RD_RS1, MASK_CUSTOM3_RD_RS1)
 DECLARE_INSN(custom3_rd_rs1_rs2, MATCH_CUSTOM3_RD_RS1_RS2, MASK_CUSTOM3_RD_RS1_RS2)
 #endif
 #ifdef DECLARE_CSR
+DECLARE_CSR(mpk, CSR_MPK)
 DECLARE_CSR(fflags, CSR_FFLAGS)
 DECLARE_CSR(frm, CSR_FRM)
 DECLARE_CSR(fcsr, CSR_FCSR)
@@ -1275,7 +1296,18 @@ DECLARE_CSR(hpmcounter28, CSR_HPMCOUNTER28)
 DECLARE_CSR(hpmcounter29, CSR_HPMCOUNTER29)
 DECLARE_CSR(hpmcounter30, CSR_HPMCOUNTER30)
 DECLARE_CSR(hpmcounter31, CSR_HPMCOUNTER31)
+
+DECLARE_CSR(ustatus, CSR_USTATUS)
+DECLARE_CSR(uie, CSR_UIE)
+DECLARE_CSR(utvec, CSR_UTVEC)
+DECLARE_CSR(uscratch, CSR_USCRATCH)
+DECLARE_CSR(uepc, CSR_UEPC)
+DECLARE_CSR(ucause, CSR_UCAUSE)
+DECLARE_CSR(utval, CSR_UTVAL)
+DECLARE_CSR(uip, CSR_UIP)
 DECLARE_CSR(sstatus, CSR_SSTATUS)
+DECLARE_CSR(sedeleg, CSR_SEDELEG)
+DECLARE_CSR(sideleg, CSR_SIDELEG)
 DECLARE_CSR(sie, CSR_SIE)
 DECLARE_CSR(stvec, CSR_STVEC)
 DECLARE_CSR(scounteren, CSR_SCOUNTEREN)
@@ -1467,5 +1499,6 @@ DECLARE_CAUSE("hypervisor_ecall", CAUSE_HYPERVISOR_ECALL)
 DECLARE_CAUSE("machine_ecall", CAUSE_MACHINE_ECALL)
 DECLARE_CAUSE("fetch page fault", CAUSE_FETCH_PAGE_FAULT)
 DECLARE_CAUSE("load page fault", CAUSE_LOAD_PAGE_FAULT)
+DECLARE_CAUSE("memory protection key fault", CAUSE_MPKEY_MISMATCH_FAULT) // Memory Protection Key address access fault
 DECLARE_CAUSE("store page fault", CAUSE_STORE_PAGE_FAULT)
 #endif
